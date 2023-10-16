@@ -1,11 +1,16 @@
 # Reactive Elasticsearch Client Concurrency Test
 
-Version:
+Credits:
+- Initial version based on article https://nurkiewicz.com/2018/01/spring-reactor-and-elasticsearch.html
+- Initial version based on source code https://github.com/nurkiewicz/elastic-flux
+
+Major dependencies:
 - springboot 3.1.4
 - elastic data reactive 5.1.4 - using elastic client - not using netty
 
 Requirements:
-- elasticsearch 7+ local or remote installation - single node or cluster without SSL
+- elasticsearch 7+ local or remote installation - single node or cluster - tested only with single node
+- optional SSL and basic security
 - java 17 or similar 
 
 The program generates test data (person objects) and pushes them using 
@@ -38,16 +43,19 @@ Observed "tuning" effects of index settings:
 Comments on connection timeouts and keep alive:
 - HTTP REST normally would open new connection for every request, protocol is stateless
 - as configured 30 max connections per route
+- connection pooling implemented by elastic library with apache asynch client
 - When using SSL the overhead of creating a connection is significant - in the order of 10-50 milliseconds
-- the program as is does not handle SSL yet
-- When using bulk requests which take hundreds of milliseconds or several seconds the role of http connection pool is lower
+- When using bulk requests which take hundreds of milliseconds or several seconds the role of http connection pooling is lower
 
 Important:
 - this test program was created to compare performance and stability with older elastic reactive library 4.4.15 based on netty
 - the overall observed execution time with library 5.1.4 is about 5-10% longer (slower)
 - no obvious differences in stability, but when timeout occurs it is on connection time while with 4.4.15 it was normally on response time
 
-Open points:
-- the client concurrency seems to reach the limit of requests per seconds already at concurrency 3-4
-- with that concurrency the more powerful servers (more cores - like 6-8, threads 12-16) still seem to be underutilized - like 10-20% busy
-- as of now - not clear what is the bottleneck
+Closing notes:
+- tested with 6 core client and 8 core server - desktop class machines
+- below comments assume similar hosting and configuration of volume and timeouts as by default
+- no exception timeouts but reaching 90% of CPU utilization on server
+- the concurrency above 10 hardly helps increase the rate of processed requests
+- when response timeout configured around 5 seconds - some requests do timeout when server is under stress
+- with enabled SSL the total execution time is about 20% longer (145 seconds vs 115 seconds)

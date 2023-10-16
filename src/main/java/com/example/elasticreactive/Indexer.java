@@ -62,6 +62,9 @@ public class Indexer {
     @Value("${indexer.index_refresh_interval}")
     private String indexerIndexRefreshInterval;
 
+    @Value("${indexer.response_warning_timeout_millis}")
+    private Integer indexerWarningTimeoutMillis;
+
     @Autowired
     ReactiveElasticsearchClient elasticsearchClient;
 
@@ -70,7 +73,6 @@ public class Indexer {
 
     @Autowired
     private PersonGenerator personGenerator;
-
 
     private final ObjectMapper objectMapper;
 
@@ -91,70 +93,82 @@ public class Indexer {
     // but blocking on this limit may cause timeouts so better control in the application code
     private Semaphore available;
 
-    private Flux<BulkResponse> indexMany(int batchSize, int batchCount, int concurrency) {
-        log.info("indexMany concurrency={}", concurrency);
+    private Flux<BulkResponse> indexManyGenerateBatch(int batchSize, int batchCount, int concurrency) {
+        log.info("indexManyGenerateBatch concurrency={}", concurrency);
+
         return personGenerator
-                .infinite()
-                .take(batchSize)
-                .collectList()
-                .repeat()
+                .finiteBatch(batchSize, batchCount)
                 .take(batchCount)
-                // .flatMap(docs -> indexManyDocSwallowErrors(docs), concurrency);
+                // .flatMap(docs -> indexManyDocs(docs), concurrency);
                 .flatMap(docs -> countConcurrent(measure(indexManyDocSwallowErrors(docs))), concurrency);
+    }
+
+    private Mono<BulkResponse> indexManyDocs(List<Doc> docs) {
+
+        return elasticsearchClient.bulk(createBulkRequest(docs));
+    }
+
+    private BulkRequest createBulkRequest(List<Doc> docs) {
+
+        BulkRequest.Builder bulkRequestBuilder = new BulkRequest.Builder();
+
+        long startTime = System.currentTimeMillis();
+        docs.forEach(doc ->
+                bulkRequestBuilder.operations(op -> op
+                        .index(idx -> {
+                                    try {
+                                        return idx
+                                                .index(indexerIndexName)
+                                                .id(doc.getUsername())
+                                                .document(objectMapper.readValue(doc.getJson(), JsonNode.class)
+                                                );
+                                    } catch (JsonProcessingException e) {
+                                        throw new RuntimeException(e);
+                                    }
+                                }
+                        )));
+        log.debug("bulk request created in millis {}",
+                System.currentTimeMillis() - startTime);
+        return bulkRequestBuilder.build();
     }
 
     private Mono<BulkResponse> indexManyDocSwallowErrors(List<Doc> docs) {
         final long startTime = System.currentTimeMillis();
         return indexManyDocs(docs)
-                .doOnSuccess(response -> {
-                    available.release();
-                    successes.increment();
-                    long duration = System.currentTimeMillis() - startTime;
-                    log.debug("success reactive bulk after {}", duration);
-                    if (duration > 1000) {
-                        log.warn("success reactive bulk after long time {}", duration);
+                .doOnSubscribe(s -> {
+                    // normally not to be used,
+                    // the concurrency  and number of available connections give enough control
+                    try {
+                        available.acquire();
+                    } catch(Exception exc) {
+                        log.error("", exc);
                     }
                 })
+                .doOnSuccess(response -> {
+                    successes.increment();
+                    if(response.took() > indexerWarningTimeoutMillis) {
+                        log.warn("response in elastic took millis {}", response.took());
+                    }
+                    long duration = System.currentTimeMillis() - startTime;
+                    log.debug("success reactive bulk after {}", duration);
+                })
                 .doOnError(e -> {
-                    available.release();
+                    failures.increment();
                     log.error("Unable to index after {}", System.currentTimeMillis() - startTime, e);
                 })
-                .doOnError(e -> failures.increment())
+                .doFinally( e -> {
+                    available.release();
+                })
                 .onErrorResume(e -> Mono.empty());
     }
 
-    private Mono<BulkResponse> indexManyDocs(List<Doc> docs) {
-
-        try {
-            BulkRequest.Builder bulkRequestBuilder = new BulkRequest.Builder();
-
-            docs.stream().forEach(doc ->
-                    bulkRequestBuilder.operations(op -> op
-                            .index(idx -> {
-                                        try {
-                                            return idx
-                                                    .index(indexerIndexName)
-                                                    .id(doc.getUsername())
-                                                    .document(objectMapper.readValue(doc.getJson(), JsonNode.class)
-                                                    );
-                                        } catch (JsonProcessingException e) {
-                                            throw new RuntimeException(e);
-                                        }
-                                    }
-                            )));
-            available.acquire();
-            log.debug("calling reactive bulk");
-            return elasticsearchClient.bulk(bulkRequestBuilder.build());
-        } catch (InterruptedException exc) {
-            log.error("interrupted ", exc);
-        }
-        return Mono.empty();
-    }
 
     private <T> Mono<T> countConcurrent(Mono<T> input) {
         return input
-                .doOnSubscribe(s -> concurrent.increment())
-                .doOnTerminate(concurrent::decrement);
+                .doOnSubscribe(s ->
+                        concurrent.increment())
+                .doOnTerminate(
+                        concurrent::decrement);
     }
 
     private <T> Mono<T> measure(Mono<T> input) {
@@ -163,7 +177,9 @@ public class Indexer {
                 .flatMap(time ->
                         input.doOnSuccess(x -> {
                             long duration = System.currentTimeMillis() - time;
-                            log.debug("took {}", duration);
+                            if(duration > indexerWarningTimeoutMillis) {
+                                log.warn("took long time {}", duration);
+                            }
                             indexTimer.record(duration, TimeUnit.MILLISECONDS);
                         })
                 );
@@ -185,7 +201,8 @@ public class Indexer {
                         log.info("index created {}", consumer.acknowledged()))
                 .doOnError(consumer ->
                         log.error("create index failed {}", consumer.getMessage())
-        );
+                )
+                .block();
     }
 
     private void deleteIndex() {
@@ -198,7 +215,8 @@ public class Indexer {
                         log.info("index deleted {}", consumer.acknowledged()))
                 .doOnError(consumer ->
                         log.error("delete index failed {}", consumer.getMessage())
-                );
+                )
+                .block();
     }
 
     @PostConstruct
@@ -210,13 +228,15 @@ public class Indexer {
 
         long startTime = System.currentTimeMillis();
         Flux
-                .range(indexerMinConcurrency, indexerMaxConcurrency)
-                .concatMap(concurrency -> indexMany(indexerBatchSize, indexerBatchCount, concurrency))
+                .range(indexerMinConcurrency, 1 + indexerMaxConcurrency - indexerMinConcurrency)
+                .concatMap(concurrency -> indexManyGenerateBatch(indexerBatchSize, indexerBatchCount, concurrency))
                 .window(Duration.ofSeconds(1))
                 .flatMap(Flux::count)
                 .subscribe(winSize -> log.info(
-                        "Got responses/sec={} elapsed from start sec {}",
-                        winSize,
+                        "Got responses/sec={} concurrent={} elapsed from start sec {}",
+                        winSize, concurrent.longValue(),
                         (System.currentTimeMillis() - startTime)/1000.0));
+
+        // never reached, above waits forerver on publisher, use /_refresh to refresh index
     }
 }

@@ -32,6 +32,7 @@ dependencies {
     // implementation 'io.codearte.jfairy:jfairy:0.5.9' // older version
     // https://mvnrepository.com/artifact/io.micrometer/micrometer-registry-graphite
     implementation 'io.micrometer:micrometer-registry-graphite:1.11.4'
+    implementation 'org.slf4j:jcl-over-slf4j:1.7.36'
 
     compileOnly 'org.projectlombok:lombok'
     annotationProcessor 'org.projectlombok:lombok'
